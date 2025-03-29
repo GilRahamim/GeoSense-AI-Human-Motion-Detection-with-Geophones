@@ -1,60 +1,171 @@
-# נתיבים לקבצים *המחולקים*
-TRAIN_DATA_DIR = "fixed_split_data/train_data"
-VAL_DATA_DIR = "fixed_split_data/validation_data"
+def load_data_hybrid_by_file(file_map, target_img_size=(IMG_HEIGHT, IMG_WIDTH)):
+    """
+    טוען את כל הקבצים המתוארים במילון file_map (שמכיל נתיבים),
+    מחלק לחלונות, מסנן, מחשב ספקטרוגרמה מותאמת בגודל,
+    ומחשב וקטור תכונות משולב (סטטיסטיות בסיסיות + ממוצעי MFCC).
+    שומר גם אינדקס group לכל קובץ מקור.
 
-TRAIN_DATA_MAP = {
-    LABEL_STEPS:   {'path': [os.path.join(TRAIN_DATA_DIR, 'train_man.csv')]},
-    LABEL_VEHICLE: {'path': [os.path.join(TRAIN_DATA_DIR, 'train_car.csv')]},
-    LABEL_NOISE:   {'path': [os.path.join(TRAIN_DATA_DIR, 'train_nothing.csv')]}
-}
+    Args:
+        file_map (dict): מילון הממפה תוויות (int) לרשימת נתיבים (list of str).
+                         e.g., {0: {'path': ['file1.csv']}, 1: {'path': ['file2.csv']}}
+        target_img_size (tuple): גודל היעד (גובה, רוחב) לספקטרוגרמה.
 
-VAL_DATA_MAP = {
-    LABEL_STEPS:   {'path': [os.path.join(VAL_DATA_DIR, 'validation_man.csv')]},
-    LABEL_VEHICLE: {'path': [os.path.join(VAL_DATA_DIR, 'validation_car2.csv')]},
-    LABEL_NOISE:   {'path': [os.path.join(VAL_DATA_DIR, 'validation_nothing2.csv')]}
-}
+    Returns:
+        tuple: (specs, stat_features, labels, groups)
+               numpy arrays המכילים את הספקטרוגרמות, התכונות, התוויות, ומספרי הקבוצה.
+               מחזיר מערכים ריקים אם לא נטענו דגימות או אם אירעה שגיאה קריטית.
+    """
+    all_specs, all_stat_features, all_labels, all_groups = [], [], [], []
+
+    # 1. תכנון המסנן
+    try:
+        nyquist = 0.5 * fs
+        low = lowcut / nyquist
+        high = highcut / nyquist
+        b, a = butter(order, [low, high], btype='band')
+    except ValueError as ve:
+        print(f"Filter design error: {ve}. Check lowcut/highcut values.")
+        return np.array([]), np.array([]), np.array([]), np.array([])
+    except Exception as e:
+        print(f"Unexpected filter design error: {e}")
+        return np.array([]), np.array([]), np.array([]), np.array([])
+
+    group_counter = 0
+    print("Loading data by file and extracting features...")
+
+    # 2. לולאה על כל תווית ורשימת הקבצים שלה
+    for label, info in file_map.items():
+        filepaths = info.get('path', []) # שימוש ב-get למניעת שגיאה אם 'path' חסר
+        if isinstance(filepaths, str):
+            filepaths = [filepaths] # טיפול במקרה שנשלח רק נתיב אחד כסטרינג
+        if not filepaths:
+            print(f"Warning: No file paths provided for label {label}. Skipping.")
+            continue
+
+        # 3. לולאה על כל קובץ בתוך הרשימה של התווית
+        for filepath in filepaths:
+            current_file_has_valid_windows = False # דגל לבדוק אם הקובץ תרם משהו
+            print(f"  Processing file: {filepath} for label {label}")
+            if not os.path.exists(filepath):
+                print(f"    ERROR: File not found: {filepath}. Skipping.")
+                continue
+
+            try:
+                # 3.1. טעינת CSV
+                df = pd.read_csv(filepath, header=None)
+
+                # 3.2. טיפול בערכים חסרים (NaN)
+                df = df.dropna(how='all') # הסרת שורות שכולן NaN
+                if df.empty:
+                    print(f"    Warning: File {filepath} is empty after dropping all-NaN rows. Skipping.")
+                    continue
+                imputer = SimpleImputer(strategy='mean')
+                # שימוש ב- .values חשוב לפני fit_transform כשאין כותרות
+                data = imputer.fit_transform(df.values)
+
+                # 3.3. ריפוד/חיתוך ערוצים
+                data = pad_channels(data, max_channels)
+
+                # 3.4. בדיקה אם יש מספיק נתונים לחלון אחד לפחות
+                if data.shape[0] < window_size:
+                    print(f"    Warning: Not enough data in {filepath} for a full window ({data.shape[0]} < {window_size}). Skipping.")
+                    continue
+
+                # 3.5. יצירת חלונות
+                # חשוב: הפונקציה create_windows מוגדרת מחוץ לפונקציה זו
+                windows, window_labels = create_windows(data, label, window_size=window_size, stride=stride)
+                if not windows:
+                     print(f"    Info: No windows created for {filepath} (possibly due to length).")
+                     continue
+
+                # 3.6. לולאה על כל חלון שנוצר
+                print(f"    Created {len(windows)} windows. Processing...")
+                window_processed_count = 0
+                for i, w in enumerate(windows):
+                    try:
+                        # 3.6.1. סינון החלון
+                        filtered_w = filtfilt(b, a, w, axis=0)
+                        # ניקח רק את הערוץ הראשון לעיבוד ספקטרוגרמה ותכונות
+                        signal_to_process = filtered_w[:, 0]
+
+                        # 3.6.2. יצירת ספקטרוגרמה
+                        # חשוב: הפונקציה create_stft_spectrogram מוגדרת מחוץ לפונקציה זו
+                        spec = create_stft_spectrogram(signal_to_process, sr=fs, n_fft=N_FFT, hop_length=HOP_LENGTH)
+                        if spec is None:
+                            # הודעת שגיאה תודפס בתוך הפונקציה create_stft_spectrogram
+                            continue # דלג לחלון הבא
+
+                        # שינוי גודל ויצירת 3 ערוצים
+                        resized_spec = cv2.resize(spec, (target_img_size[1], target_img_size[0]), interpolation=cv2.INTER_LINEAR)
+                        spec_3ch = np.stack([resized_spec] * 3, axis=0) # יוצר (3, H, W)
+
+                        # 3.6.3. חילוץ תכונות משולבות
+                        # חשוב: הפונקציה extract_statistical_features מוגדרת מחוץ לפונקציה זו
+                        stat_feats_base = extract_statistical_features(signal_to_process, sr=fs)
+                        # בדיקת גודל הוקטור הבסיסי (לפני MFCC)
+                        expected_base_size = 8 + 13
+                        if stat_feats_base.shape[0] != expected_base_size:
+                            print(f"    Warning (Window {i}): Base feature vector size mismatch ({stat_feats_base.shape[0]} vs {expected_base_size}). Skipping window.")
+                            continue
+
+                        # חישוב ממוצעי MFCC
+                        try:
+                           mfccs_feats = librosa.feature.mfcc(y=signal_to_process.astype(np.float32), sr=fs, n_mfcc=13).mean(axis=1)
+                           if mfccs_feats.shape[0] != 13:
+                               print(f"    Warning (Window {i}): MFCC vector size mismatch ({mfccs_feats.shape[0]} vs 13). Skipping window.")
+                               continue
+                        except Exception as mfcc_e:
+                            print(f"    Error calculating MFCC for window {i}: {mfcc_e}. Skipping window.")
+                            continue
+
+                        # איחוד התכונות
+                        combined_features = np.concatenate([stat_feats_base, mfccs_feats])
+
+                        # בדיקת גודל סופית
+                        if combined_features.shape[0] != NUM_STAT_FEATURES:
+                            print(f"    ERROR (Window {i}): Final combined feature vector size mismatch ({combined_features.shape[0]} vs {NUM_STAT_FEATURES}). This should not happen! Skipping window.")
+                            continue
+
+                        # 3.6.4. הוספת הנתונים המעובדים לרשימות
+                        all_specs.append(spec_3ch)
+                        all_stat_features.append(combined_features)
+                        all_labels.append(window_labels[i]) # לוקחים את התווית המתאימה מהרשימה ש-create_windows החזירה
+                        all_groups.append(group_counter) # כל החלונות מאותו קובץ מקבלים אותו group_counter
+                        window_processed_count += 1
+                        current_file_has_valid_windows = True
+
+                    except Exception as inner_e:
+                        print(f"    Error processing window {i} in file {filepath}: {inner_e}")
+                        # אפשר להוסיף כאן traceback להדפסת שגיאה מלאה יותר אם רוצים
+                        # import traceback
+                        # traceback.print_exc()
+
+                print(f"    Successfully processed {window_processed_count} windows for this file.")
+
+            except pd.errors.EmptyDataError:
+                 print(f"    ERROR: File '{filepath}' seems empty or has parsing issues. Skipping.")
+            except Exception as e:
+                print(f"    ERROR loading or processing file {filepath}: {e}")
+                # import traceback
+                # traceback.print_exc()
+
+            # קדם את מונה הקבוצות *רק* אם הקובץ הנוכחי אכן תרם חלונות
+            if current_file_has_valid_windows:
+                group_counter += 1
+            else:
+                 print(f"    Note: File {filepath} did not contribute any valid windows.")
 
 
-
-
-
-
-
-
-# --- טעינת נתוני אימון ---
-print("\n=== Loading Prepared Training Dataset ===")
-# לא צריכים groups יותר כי החלוקה קבועה
-train_specs, train_stat_feats, train_labels, _ = load_data_hybrid_by_file(TRAIN_DATA_MAP)
-if train_specs.size == 0:
-    print("CRITICAL ERROR: Failed to load training dataset. Exiting.")
-    exit()
-# נעביר את הנתונים האלה ישירות ל-SMOTE בהמשך
-
-# --- טעינת נתוני וולידציה ---
-print("\n=== Loading Prepared Validation Dataset ===")
-val_specs, val_stat_feats, val_labels, _ = load_data_hybrid_by_file(VAL_DATA_MAP)
-if val_specs.size == 0:
-    print("CRITICAL ERROR: Failed to load validation dataset. Exiting.")
-    exit()
-# נעביר את הנתונים האלה ישירות ליצירת val_dataset בהמשך
-
-# --- החלף את החלק הזה: ---
-# X_spec_train = orig_specs[train_idx]
-# X_stat_train_orig = orig_stat_feats[train_idx]
-# y_train_orig = orig_labels[train_idx]
-# X_spec_val   = orig_specs[val_idx]
-# X_stat_val   = orig_stat_feats[val_idx]
-# y_val        = orig_labels[val_idx]
-# --- בנתונים שטענו עכשיו ---
-X_spec_train = train_specs           # נתוני אימון - ספקטרוגרמות
-X_stat_train_orig = train_stat_feats # נתוני אימון - תכונות (לפני SMOTE)
-y_train_orig = train_labels          # נתוני אימון - תוויות (לפני SMOTE)
-
-X_spec_val = val_specs             # נתוני וולידציה - ספקטרוגרמות
-X_stat_val = val_stat_feats       # נתוני וולידציה - תכונות
-y_val = val_labels                # נתוני וולידציה - תוויות
-
-print(f"Loaded Train samples: {len(y_train_orig)}")
-print(f"Loaded Validation samples: {len(y_val)}")
-print(f"Train labels distribution before SMOTE: {np.bincount(y_train_orig)}")
-print(f"Validation labels distribution: {np.bincount(y_val)}")
+    # 4. המרה למערכי NumPy והחזרה
+    print("-" * 30)
+    print(f"Total valid samples loaded across all files: {len(all_specs)}")
+    if len(all_specs) > 0:
+        # ודא שכל הרשימות באותו אורך לפני ההמרה
+        assert len(all_specs) == len(all_stat_features) == len(all_labels) == len(all_groups), "Length mismatch between collected lists!"
+        return np.array(all_specs, dtype=np.float32), \
+               np.array(all_stat_features, dtype=np.float32), \
+               np.array(all_labels, dtype=np.int64), \
+               np.array(all_groups, dtype=np.int64)
+    else:
+        print("Warning: No valid samples were loaded.")
+        return np.array([]), np.array([]), np.array([]), np.array([])
