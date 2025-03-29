@@ -1,153 +1,417 @@
+import numpy as np
 import pandas as pd
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+# ודא שאתה מייבא את אותה ארכיטקטורת מודל מהאימון
+from torchvision.models import efficientnet_b0, EfficientNet_B0_Weights
+from sklearn.preprocessing import StandardScaler # רק לטעינה, לא לאימון
+from sklearn.metrics import accuracy_score, confusion_matrix, classification_report
+from scipy.signal import butter, filtfilt, spectrogram
+import librosa
+import matplotlib.pyplot as plt
+import seaborn as sns
+import cv2
 import os
-import math
+import glob
+import time
+import warnings
+import torch.nn.functional as F
+from sklearn.impute import SimpleImputer
+import argparse # נוסיף אפשרות להעביר נתיבים כארגומנטים
 
-print("--- Starting Manual Data Split Script (V2: Splitting 'nothing.csv') ---")
+warnings.filterwarnings("ignore")
 
-# ======================================================================
-# =                       הגדרות ותצורה                              =
-# ======================================================================
+# =====================================================================================
+# =                             הגדרות (חייבות להיות זהות לאימון!)                      =
+# =====================================================================================
 
-SOURCE_DATA_DIR = "."
-OUTPUT_BASE_DIR = "fixed_split_data_v2" # <--- שם תיקייה חדש!
-TRAIN_DIR_NAME = "train_data"
-VALIDATION_DIR_NAME = "validation_data"
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
 
-# יחס החלוקה לקבצים שיש לפצל
-TRAIN_SPLIT_RATIO = 0.8 # 80% לאימון, 20% לוולידציה
+# תוויות ושמות מחלקות
+LABEL_STEPS    = 0
+LABEL_VEHICLE  = 1
+LABEL_NOISE    = 2
+CLASS_NAMES    = ["Steps", "Vehicle", "Noise"]
+NUM_CLASSES    = 3
 
-# אסטרטגיית החלוקה החדשה:
-SPLIT_CONFIG = {
-    "train": [
-        {"original_file": "man.csv", "output_file": "train_man.csv", "split": True},
-        {"original_file": "car.csv", "output_file": "train_car.csv", "split": False}, # כל הקובץ
-        {"original_file": "nothing.csv", "output_file": "train_nothing.csv", "split": True} # <-- נפצל את זה
-    ],
-    "validation": [
-        {"original_file": "man.csv", "output_file": "validation_man.csv", "split": True},
-        {"original_file": "car2.csv", "output_file": "validation_car2.csv", "split": False}, # כל הקובץ
-        {"original_file": "nothing.csv", "output_file": "validation_nothing.csv", "split": True} # <-- נפצל את זה
-        # לא נשתמש ב-nothing2.csv בכלל בניסוי הזה
-    ]
-}
+# פרמטרים זהים לאימון של המודל שנטען
+window_size    = 2000
+fs             = 1000.0
+max_channels   = 37
+NUM_STAT_FEATURES = 8 + 13 + 13 # כולל MFCCs
+N_FFT          = 512
+HOP_LENGTH     = N_FFT // 4
+IMG_HEIGHT     = 224
+IMG_WIDTH      = 224
+lowcut         = 1.0
+highcut        = 100.0
+order          = 4
+BATCH_SIZE     = 32 # אפשר להגדיל להערכה אם הזיכרון מאפשר
 
-# ======================================================================
-# =                      יצירת תיקיות פלט                           =
-# ======================================================================
-train_output_dir = os.path.join(OUTPUT_BASE_DIR, TRAIN_DIR_NAME)
-validation_output_dir = os.path.join(OUTPUT_BASE_DIR, VALIDATION_DIR_NAME)
+# --- הגדרות קריטיות לטעינת המודל (צריכות להתאים למודל שנשמר) ---
+# ערכים אלו לא משפיעים ישירות על הטעינה אם המודל הוגדר נכון,
+# אבל נשאיר אותם לצורך אתחול הארכיטקטורה לפני טעינת המשקולות.
+# מומלץ להשתמש בערכים מהריצה שבה נשמר המודל.
+DROPOUT_P     = 0.4 # הערך מהריצה המוצלחת (או מה-checkpoint אם שמרת)
+STAT_DIM      = 64
+COMB_DIM      = 128
+# -------------------------------------------------------------
 
-try:
-    os.makedirs(train_output_dir, exist_ok=True)
-    os.makedirs(validation_output_dir, exist_ok=True)
-    print(f"Output directories created/ensured:")
-    print(f"  Train data: {train_output_dir}")
-    print(f"  Validation data: {validation_output_dir}")
-except OSError as e:
-    print(f"Error creating directories: {e}")
-    exit()
-print("-" * 30)
+# =====================================================================================
+# =          פונקציות עזר וקלאסים (חייבים להיות זהים לאימון!)                      =
+# =====================================================================================
 
-# ======================================================================
-# =                      תהליך הפיצול והשמירה                         =
-# ======================================================================
+# --- העתק לכאן את ההגדרות המדויקות של הפונקציות והקלאסים הבאים מהקוד הראשי שלך: ---
+# 1. def pad_channels(...)
+# 2. def create_windows(...)
+# 3. def create_stft_spectrogram(...)
+# 4. def extract_statistical_features(...)
+# 5. def load_data_hybrid_by_file(...) <-- הגרסה המתוקנת האחרונה
+# 6. class HybridGeoModel(...) <-- הגדרת הארכיטקטורה
+# 7. class HybridDataset(...)
+# ---------------------------------------------------------------------------------
+# (הדבק כאן את הקוד של הפונקציות והקלאסים האלה)
+def pad_channels(data, target_channels):
+    if data.ndim == 1: data = data.reshape(-1, 1)
+    current_channels = data.shape[1]
+    if current_channels < target_channels:
+        padding = np.zeros((data.shape[0], target_channels - current_channels), dtype=data.dtype)
+        return np.hstack((data, padding))
+    elif current_channels > target_channels: return data[:, :target_channels]
+    else: return data
 
-processed_files_split_parts = {} # מילון לשמירת החלקים של הקבצים המפוצלים
+def create_windows(signal, label, window_size=window_size, stride=250): # שימוש בברירת מחדל stride מהאימון
+    X_windows, y_labels = [], []
+    if signal.shape[0] < window_size: return [], []
+    for start in range(0, signal.shape[0] - window_size + 1, stride):
+        X_windows.append(signal[start: start + window_size, :])
+        y_labels.append(label)
+    return X_windows, y_labels
 
-# --- לולאה על כל קבצי המקור שדורשים פיצול ---
-files_to_split = set()
-for group in ["train", "validation"]:
-    for item in SPLIT_CONFIG[group]:
-        if item["split"]:
-            files_to_split.add(item["original_file"])
-
-print(f"Files identified for splitting: {list(files_to_split)}")
-
-for original_filename in files_to_split:
-    source_path = os.path.join(SOURCE_DATA_DIR, original_filename)
-    print(f"  Pre-splitting '{original_filename}'...")
-
-    if not os.path.exists(source_path):
-        print(f"    ERROR: Source file not found: {source_path}. Cannot split.")
-        continue
-
+def create_stft_spectrogram(signal_1d, sr=fs, n_fft=N_FFT, hop_length=HOP_LENGTH):
     try:
-        df = pd.read_csv(source_path, header=None)
-        if df.empty:
-            print(f"    WARNING: Source file '{original_filename}' is empty. Skipping split.")
-            processed_files_split_parts[original_filename] = {'train': df.iloc[0:0], 'validation': df.iloc[0:0]}
-            continue
-
-        total_rows = len(df)
-        split_point = math.floor(total_rows * TRAIN_SPLIT_RATIO)
-
-        if split_point == 0 or split_point >= total_rows:
-            print(f"    WARNING: Invalid split point for {original_filename}. Check ratio or file length.")
-            # במקרה כזה, נשים הכל ב-train (אם יש משהו) ונשאיר validation ריק
-            df_train_part = df if split_point > 0 else df.iloc[0:0]
-            df_val_part = df.iloc[0:0] # וולידציה ריקה
-            print(f"    Assigning all {len(df_train_part)} rows to Train, 0 to Validation.")
-        else:
-            df_train_part = df.iloc[:split_point]
-            df_val_part = df.iloc[split_point:]
-            print(f"    Split: {len(df_train_part)} rows for Train, {len(df_val_part)} rows for Validation.")
-
-        processed_files_split_parts[original_filename] = {
-            'train': df_train_part,
-            'validation': df_val_part
-        }
-
+        signal_float = signal_1d.astype(np.float32)
+        f, t, Sxx = spectrogram(signal_float, fs=sr, nperseg=n_fft, noverlap=n_fft - hop_length, nfft=n_fft)
+        freq_idx = np.where(f <= highcut)[0]
+        if len(freq_idx) == 0: return None
+        Sxx = Sxx[freq_idx, :]
+        Sxx_db = 10 * np.log10(Sxx + 1e-9)
+        Sxx_norm = (Sxx_db - Sxx_db.min()) / (Sxx_db.max() - Sxx_db.min() + 1e-9)
+        return Sxx_norm.astype(np.float32)
     except Exception as e:
-        print(f"    ERROR during pre-splitting of {original_filename}: {e}")
+        print(f"Error in STFT: {e}"); return None
+
+def extract_statistical_features(signal_1d, sr=fs):
+    try:
+        features = []
+        features.append(np.mean(signal_1d)); features.append(np.std(signal_1d)); features.append(np.sqrt(np.mean(signal_1d**2)))
+        features.append(librosa.feature.zero_crossing_rate(y=signal_1d).mean())
+        stft_result = librosa.stft(signal_1d.astype(np.float32), n_fft=N_FFT, hop_length=HOP_LENGTH)
+        spec_mag = np.abs(stft_result)
+        features.append(librosa.feature.spectral_centroid(S=spec_mag, sr=sr).mean())
+        features.append(librosa.feature.spectral_bandwidth(S=spec_mag, sr=sr).mean())
+        features.append(librosa.feature.spectral_rolloff(S=spec_mag, sr=sr, roll_percent=0.85).mean())
+        features.append(librosa.feature.spectral_flatness(S=spec_mag).mean())
+        return np.array(features, dtype=np.float32) # מחזיר רק את ה-8 הבסיסיים
+    except Exception as e:
+        print(f"Error extracting base statistical features: {e}")
+        return np.zeros(8, dtype=np.float32)
+
+def load_data_hybrid_by_file(file_map, target_img_size=(IMG_HEIGHT, IMG_WIDTH)):
+    all_specs, all_stat_features, all_labels, all_groups = [], [], [], []
+    try: b, a = butter(order, [lowcut/(fs/2), highcut/(fs/2)], btype='band')
+    except Exception as e: print(f"Filter error: {e}"); return [],[],[],[]
+    group_counter = 0
+    print("Loading data by file and extracting features...")
+    for label, info in file_map.items():
+        filepaths = info.get('path', [])
+        if isinstance(filepaths, str): filepaths = [filepaths]
+        if not filepaths: continue
+        for filepath in filepaths:
+            current_file_has_valid_windows = False
+            print(f"  Processing file: {filepath} for label {label}")
+            if not os.path.exists(filepath): print(f"    ERROR: File not found: {filepath}. Skipping."); continue
+            try:
+                df = pd.read_csv(filepath, header=None)
+                df = df.dropna(how='all');
+                if df.empty: print(f"    Warning: File {filepath} is empty after dropna. Skipping."); continue
+                imputer = SimpleImputer(strategy='mean'); data = imputer.fit_transform(df.values)
+                data = pad_channels(data, max_channels)
+                if data.shape[0] < window_size: print(f"    Warning: Not enough data in {filepath} ({data.shape[0]} < {window_size}). Skipping."); continue
+                windows, window_labels = create_windows(data, label)
+                if not windows: continue
+                print(f"    Created {len(windows)} windows. Processing...")
+                window_processed_count = 0
+                for i, w in enumerate(windows):
+                    try:
+                        filtered_w = filtfilt(b, a, w, axis=0); signal_to_process = filtered_w[:, 0]
+                        spec = create_stft_spectrogram(signal_to_process);
+                        if spec is None: continue
+                        resized_spec = cv2.resize(spec, (target_img_size[1], target_img_size[0]), interpolation=cv2.INTER_LINEAR)
+                        spec_3ch = np.stack([resized_spec] * 3, axis=0)
+                        stat_feats_base = extract_statistical_features(signal_to_process)
+                        expected_base_size = 8 # רק 8 מהפונקציה הזו
+                        if stat_feats_base.shape[0] != expected_base_size: print(f"    Warning (Win {i}): Base feature size mismatch ({stat_feats_base.shape[0]} vs {expected_base_size}). Skipping."); continue
+                        try:
+                           mfccs_feats = librosa.feature.mfcc(y=signal_to_process.astype(np.float32), sr=fs, n_mfcc=13).mean(axis=1)
+                           if mfccs_feats.shape[0] != 13: print(f"    Warning (Win {i}): MFCC vector size mismatch ({mfccs_feats.shape[0]} vs 13). Skipping."); continue
+                        except Exception as mfcc_e: print(f"    Error calculating MFCC for window {i}: {mfcc_e}. Skipping."); continue
+                        # איחוד תכונות: 8 בסיסי + 13 מ-MFCC כאן + 13 מ-MFCC חיצונית בטעינה המקורית = 34? לא, זה צריך להיות עקבי
+                        # **תיקון קריטי כאן: הפונקציה הזו צריכה להחזיר את אותו וקטור תכונות כמו באימון**
+                        # נניח שהוקטור המלא באימון היה 8 + 13 + 13 = 34
+                        # נצטרך לחשב שוב את 13 התכונות הסטטיסטיות הנוספות (spectral)
+                        stat_feats_spectral = []
+                        try:
+                            stft_result = librosa.stft(signal_to_process.astype(np.float32), n_fft=N_FFT, hop_length=HOP_LENGTH)
+                            spec_mag = np.abs(stft_result)
+                            stat_feats_spectral.append(librosa.feature.spectral_centroid(S=spec_mag, sr=fs).mean())
+                            stat_feats_spectral.append(librosa.feature.spectral_bandwidth(S=spec_mag, sr=fs).mean())
+                            stat_feats_spectral.append(librosa.feature.spectral_rolloff(S=spec_mag, sr=fs, roll_percent=0.85).mean())
+                            stat_feats_spectral.append(librosa.feature.spectral_flatness(S=spec_mag).mean())
+                            # חסר לנו 4 תכונות כדי להגיע ל-13? או שהיו רק 4 ספקטרליות?
+                            # נבדוק את הקוד המקורי: אכן היו רק 4 ספקטרליות + 13 MFCC = 17 + 8 בסיסי = 25?
+                            # נבדוק שוב את extract_statistical_features המקורי:
+                            # הוא החזיר 8 בסיסי + 13 MFCC = 21. אם הוספנו עוד 13 MFCC בחוץ, זה לא נכון.
+                            # הפונקציה המקורית שלך החזירה 8 בסיסיות + 13 MFCC. הגודל הוא 21.
+                            # אבל ה-NUM_STAT_FEATURES הוגדר כ-34? זה לא הגיוני.
+                            # נחזור להגדרה של 8+13 = 21.
+                            # *** הנחה מחודשת: NUM_STAT_FEATURES צריך להיות 21 ***
+                            if len(stat_feats_base) + len(mfccs_feats) != 21:
+                                 print(f"ERROR: Mismatch in feature calculation. Base={len(stat_feats_base)}, MFCC={len(mfccs_feats)}")
+                                 continue
+                            combined_features = np.concatenate([stat_feats_base[:8], mfccs_feats]) # 8 בסיסי + 13 MFCC
+                            if combined_features.shape[0] != 21: # בדיקה סופית לגודל 21
+                                print(f"    ERROR (Window {i}): Final combined feature vector size mismatch ({combined_features.shape[0]} vs 21). Skipping.")
+                                continue
+
+                        except Exception as spec_e:
+                            print(f"    Error calculating spectral features for window {i}: {spec_e}. Skipping.")
+                            continue
+
+                        all_specs.append(spec_3ch); all_stat_features.append(combined_features)
+                        all_labels.append(int(window_labels[i])); all_groups.append(group_counter)
+                        window_processed_count += 1; current_file_has_valid_windows = True
+                    except Exception as inner_e: print(f"    Error processing window {i}: {inner_e}")
+                print(f"    Successfully processed {window_processed_count} windows.")
+            except Exception as e: print(f"    ERROR loading or processing file {filepath}: {e}")
+            if current_file_has_valid_windows: group_counter += 1
+            else: print(f"    Note: File {filepath} did not contribute valid windows.")
+    print("-" * 30); print(f"Total valid samples loaded: {len(all_specs)}")
+    if len(all_specs) > 0:
+        assert len(all_specs) == len(all_stat_features) == len(all_labels) == len(all_groups)
+        return np.array(all_specs, dtype=np.float32), np.array(all_stat_features, dtype=np.float32), \
+               np.array(all_labels, dtype=np.int64), np.array(all_groups, dtype=np.int64)
+    else: return np.array([]), np.array([]), np.array([]), np.array([])
+
+class HybridGeoModel(nn.Module):
+    # *** הנחה מחודשת לגבי גודל הכניסה ל-MLP ***
+    # בהנחה ש-NUM_STAT_FEATURES הוא באמת 21 (8 בסיסי + 13 MFCC)
+    def __init__(self, dropout_p=DROPOUT_P, stat_feature_dim=STAT_DIM, combined_dim=COMB_DIM, input_stat_features=21):
+        super(HybridGeoModel, self).__init__()
+        weights = EfficientNet_B0_Weights.DEFAULT; self.cnn_backbone = efficientnet_b0(weights=weights)
+        original_classifier = self.cnn_backbone.classifier
+        if isinstance(original_classifier, nn.Sequential) and len(original_classifier) > 1 and isinstance(original_classifier[1], nn.Linear):
+            out_channels = original_classifier[1].in_features
+        elif isinstance(original_classifier, nn.Linear): out_channels = original_classifier.in_features
+        else: print("Warning: Using default out_channels=1280."); out_channels = 1280
+        print(f"[DEBUG] CNN output features: {out_channels}")
+        self.cnn_backbone.classifier = nn.Identity()
+        self.stat_mlp = nn.Sequential( # משתמשים ב-input_stat_features החדש
+            nn.LayerNorm(input_stat_features),
+            nn.Linear(input_stat_features, stat_feature_dim * 2), nn.ReLU(), nn.Dropout(dropout_p),
+            nn.Linear(stat_feature_dim * 2, stat_feature_dim), nn.ReLU() )
+        self.dropout = nn.Dropout(dropout_p)
+        self.fc_combined = nn.Linear(out_channels + stat_feature_dim, combined_dim)
+        self.fc_output = nn.Linear(combined_dim, NUM_CLASSES)
+    def forward(self, spec_input, stat_input):
+        cnn_features = self.cnn_backbone(spec_input); stat_features = self.stat_mlp(stat_input)
+        combined = torch.cat((cnn_features, stat_features), dim=1)
+        x = self.dropout(combined); x = F.relu(self.fc_combined(x)); x = self.dropout(x)
+        out = self.fc_output(x); return out
+
+class HybridDataset(Dataset):
+    def __init__(self, specs, stat_feats, labels, transform=None):
+        self.specs=specs; self.stat_feats=stat_feats; self.labels=labels; self.transform=transform
+    def __len__(self): return len(self.labels)
+    def __getitem__(self, idx):
+        spec = self.specs[idx]; stat_feat = self.stat_feats[idx] # אין הוספת רעש בהערכה
+        label = self.labels[idx]; spec_tensor = torch.tensor(spec, dtype=torch.float32)
+        if self.transform: spec_tensor = self.transform(spec_tensor)
+        stat_tensor = torch.tensor(stat_feat, dtype=torch.float32)
+        return spec_tensor, stat_tensor, label
+# =====================================================================================
+# =                          פונקציית הערכה                                          =
+# =====================================================================================
+def evaluate_model_on_new_data(model, dataloader, device):
+    model.eval() # חשוב מאוד למצב הערכה
+    all_labels = []
+    all_preds = []
+    with torch.no_grad(): # אין צורך לחשב גרדיאנטים
+        for specs, stat_feats, labels in dataloader:
+            specs = specs.to(device)
+            stat_feats = stat_feats.to(device)
+            labels = labels.to(device) # למרות שלא נשתמש בהם לחישוב loss
+
+            outputs = model(specs, stat_feats)
+            preds = outputs.argmax(dim=1)
+
+            all_labels.extend(labels.cpu().numpy())
+            all_preds.extend(preds.cpu().numpy())
+
+    return all_labels, all_preds
+
+# =====================================================================================
+# =                             Main Evaluation Script                               =
+# =====================================================================================
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Evaluate a trained hybrid model on new data.")
+    parser.add_argument("model_path", help="Path to the saved model .pth file")
+    parser.add_argument("new_data_dir", help="Path to the directory containing new data CSV files")
+    args = parser.parse_args()
+
+    MODEL_PATH = args.model_path
+    NEW_DATA_FOLDER = args.new_data_dir
+    NEW_DATA_PATTERN = '*.csv' # נניח שכל קבצי ה-CSV רלוונטיים
+
+    # 1. טעינת המודל וה-Scaler
+    if not os.path.exists(MODEL_PATH):
+        print(f"ERROR: Model file not found at {MODEL_PATH}")
+        exit()
+
+    print(f"Loading model and scaler from {MODEL_PATH}")
+    checkpoint = torch.load(MODEL_PATH, map_location=device) # טעינה להתקן הנכון
+
+    # --- קביעת גודל התכונות מהמודל שנשמר (אם אפשר) ---
+    # נבדוק אם גודל שכבת הנרמול הראשונה ב-MLP נשמר
+    try:
+         # ניסיון לקרוא את גודל הכניסה משם המפתח או מהמשקולות
+         input_stat_features_loaded = checkpoint['model_state_dict']['stat_mlp.0.weight'].shape[1]
+         print(f"Inferred input_stat_features from loaded model: {input_stat_features_loaded}")
+         # עדכון הגודל לשימוש באתחול המודל
+         INPUT_STAT_FEATURES_FOR_MODEL = input_stat_features_loaded
+    except KeyError:
+         print(f"Warning: Could not infer input_stat_features from model state dict. Using default: {NUM_STAT_FEATURES}")
+         INPUT_STAT_FEATURES_FOR_MODEL = NUM_STAT_FEATURES # ברירת מחדל
+    # -------------------------------------------------
+
+    model = HybridGeoModel(dropout_p=DROPOUT_P, stat_feature_dim=STAT_DIM,
+                           combined_dim=COMB_DIM, input_stat_features=INPUT_STAT_FEATURES_FOR_MODEL).to(device)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model.eval() # חשוב מאוד!
+
+    if 'scaler' not in checkpoint:
+        print("ERROR: Scaler not found in the checkpoint file. Cannot proceed.")
+        exit()
+    scaler = checkpoint['scaler']
+    print("Model and scaler loaded successfully.")
+
+    # 2. מציאת ומיפוי קבצי נתונים חדשים
+    print(f"\nSearching for new data files in: {NEW_DATA_FOLDER}")
+    new_files = glob.glob(os.path.join(NEW_DATA_FOLDER, NEW_DATA_PATTERN))
+
+    if not new_files:
+        print("No new data files found.")
+        exit()
+
+    new_data_map = {LABEL_STEPS: {'path': []}, LABEL_VEHICLE: {'path': []}, LABEL_NOISE: {'path': []}}
+    unlabeled_files = []
+    for f in new_files:
+        filename_lower = os.path.basename(f).lower()
+        if "man" in filename_lower or "step" in filename_lower:
+            new_data_map[LABEL_STEPS]['path'].append(f)
+        elif "car" in filename_lower or "vehicle" in filename_lower:
+            new_data_map[LABEL_VEHICLE]['path'].append(f)
+        elif "nothing" in filename_lower or "noise" in filename_lower:
+            new_data_map[LABEL_NOISE]['path'].append(f)
+        else:
+            unlabeled_files.append(f)
+
+    if unlabeled_files:
+        print("\nWarning: Could not automatically determine label for the following files:")
+        for f in unlabeled_files: print(f"  - {f}")
+        print("These files will be ignored.")
+
+    # הסרת מחלקות ריקות
+    new_data_map = {k: v for k, v in new_data_map.items() if v['path']}
+    if not new_data_map:
+        print("\nNo new data files were successfully mapped to known labels. Exiting.")
+        exit()
+
+    print("\nLabel mapping for new data:")
+    for label, info in new_data_map.items():
+        print(f"  Label {label} ({CLASS_NAMES[label]}): {len(info['path'])} files")
 
 
-print("-" * 30)
+    # 3. טעינה ועיבוד נתונים חדשים
+    # ודא ש-NUM_STAT_FEATURES מוגדר נכון *לפני* הקריאה לפונקציה הזו
+    # בהתאם לתיקון שבוצע בה, הוא צריך להיות 21
+    NUM_STAT_FEATURES = 21 # הגדרה מחדש לפני הקריאה
+    new_specs, new_stat_feats, new_labels, _ = load_data_hybrid_by_file(new_data_map)
 
-# --- שמירת הקבצים המחולקים ---
-for group, output_dir in [("train", train_output_dir), ("validation", validation_output_dir)]:
-    print(f"Saving files for {group.upper()} set...")
-    for item in SPLIT_CONFIG[group]:
-        original_filename = item["original_file"]
-        output_filename = item["output_file"]
-        needs_split = item["split"]
-        output_path = os.path.join(output_dir, output_filename)
+    if new_specs.size == 0:
+        print("\nNo valid samples could be loaded from the new data files. Exiting.")
+        exit()
 
-        print(f"  Processing '{original_filename}' -> '{output_filename}'")
-
-        try:
-            # אם הקובץ פוצל מראש
-            if needs_split:
-                if original_filename in processed_files_split_parts:
-                    df_to_save = processed_files_split_parts[original_filename][group]
-                else:
-                     print(f"    WARNING: File '{original_filename}' was marked for split but not found in pre-split parts. Skipping.")
-                     continue
-            # אם צריך לקחת את כל הקובץ המקורי (ולא פוצל)
-            else:
-                source_path = os.path.join(SOURCE_DATA_DIR, original_filename)
-                if not os.path.exists(source_path):
-                     print(f"    ERROR: Source file not found: {source_path}. Skipping.")
-                     continue
-                df_to_save = pd.read_csv(source_path, header=None)
-                if df_to_save.empty:
-                     print(f"    WARNING: Source file '{original_filename}' is empty. Creating empty output file.")
-                     # ניצור קובץ ריק כדי שהטעינה לא תיכשל לגמרי
-                     open(output_path, 'w').close()
-                     continue
-
-            # שמירת הקובץ
-            if not df_to_save.empty:
-                 df_to_save.to_csv(output_path, index=False, header=False)
-                 print(f"    Saved {len(df_to_save)} rows to '{output_path}'")
-            elif os.path.exists(output_path): # אם יצרנו קובץ ריק קודם
-                 print(f"    Saved empty file to '{output_path}'")
-            else: # אם ה-DataFrame ריק מהפיצול
-                 open(output_path, 'w').close() # יצירת קובץ ריק
-                 print(f"    Saved empty file to '{output_path}' (from split)")
+    # 4. Scaling תכונות סטטיסטיות (עם ה-Scaler שנטען!)
+    print("\nScaling statistical features using the loaded scaler...")
+    try:
+        new_stat_scaled = scaler.transform(new_stat_feats)
+    except ValueError as e:
+         print(f"ERROR: Shape mismatch during scaling. Loaded features shape: {new_stat_feats.shape}, Scaler expected: {scaler.n_features_in_}")
+         print("This likely means the number of statistical features calculated now is different from training.")
+         print(f"Current NUM_STAT_FEATURES is set to {NUM_STAT_FEATURES}. Check feature extraction functions.")
+         exit()
+    except Exception as e:
+         print(f"An unexpected error occurred during scaling: {e}")
+         exit()
 
 
-        except Exception as e:
-            print(f"    ERROR saving file {output_filename} for {group} set: {e}")
+    # 5. יצירת Dataset ו-DataLoader
+    print("Creating Dataset and DataLoader for new data...")
+    # הגדרת טרנספורמציות (רק נרמול, כמו בוולידציה)
+    imagenet_mean = [0.485, 0.456, 0.406]
+    imagenet_std  = [0.229, 0.224, 0.225]
+    eval_transforms = transforms.Compose([
+        transforms.Normalize(mean=imagenet_mean, std=imagenet_std)
+    ])
 
-print("-" * 30)
-print("--- Manual Data Split Script (V2) Finished ---")
+    new_dataset = HybridDataset(new_specs, new_stat_scaled, new_labels, transform=eval_transforms)
+    # שימוש ב-num_workers=0 יכול לעזור אם יש בעיות עם מקביליות בטעינה
+    new_loader = DataLoader(new_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+
+    # 6. הרצת הערכה
+    print("\n--- Evaluating Model on New Data ---")
+    start_eval_time = time.time()
+    true_labels, pred_labels = evaluate_model_on_new_data(model, new_loader, device)
+    eval_duration = time.time() - start_eval_time
+    print(f"Evaluation finished in {eval_duration:.2f} seconds.")
+
+    # 7. הצגת התוצאות
+    if not true_labels or not pred_labels:
+        print("\nEvaluation did not produce results.")
+    else:
+        accuracy = accuracy_score(true_labels, pred_labels)
+        print(f"\nOverall Accuracy on New Data: {accuracy:.4f}")
+
+        print("\nConfusion Matrix (New Data):")
+        cm = confusion_matrix(true_labels, pred_labels, labels=range(NUM_CLASSES))
+        plt.figure(figsize=(6, 5))
+        sns.heatmap(cm, annot=True, fmt="d", cmap="Greens",
+                    xticklabels=CLASS_NAMES, yticklabels=CLASS_NAMES)
+        plt.title("New Data - Confusion Matrix")
+        plt.ylabel("True Label"); plt.xlabel("Predicted Label")
+        # שמירת הגרף (אופציונלי)
+        # plt.savefig("new_data_confusion_matrix.png")
+        plt.show()
+
+        print("\nClassification Report (New Data):")
+        # שימוש ב-labels וב-zero_division
+        print(classification_report(true_labels, pred_labels, target_names=CLASS_NAMES,
+                                  labels=range(NUM_CLASSES), zero_division=0))
+        print("-" * 50)
+
+    print("\n=== Evaluation Script Finished ===")
