@@ -1,159 +1,60 @@
-import pandas as pd
-import os
-import math
+# נתיבים לקבצים *המחולקים*
+TRAIN_DATA_DIR = "fixed_split_data/train_data"
+VAL_DATA_DIR = "fixed_split_data/validation_data"
 
-print("--- Starting Manual Data Split Script ---")
-
-# ======================================================================
-# =                       הגדרות ותצורה                              =
-# ======================================================================
-
-# 1. נתיב לקבצים המקוריים (שנה אם הם לא בתיקייה הנוכחית)
-SOURCE_DATA_DIR = "." # התיקייה הנוכחית
-
-# 2. שם התיקייה הראשית שתכיל את הנתונים המחולקים
-OUTPUT_BASE_DIR = "fixed_split_data"
-
-# 3. שמות תתי-התיקיות לאימון ולוולידציה
-TRAIN_DIR_NAME = "train_data"
-VALIDATION_DIR_NAME = "validation_data"
-
-# 4. אסטרטגיית החלוקה (החשוב ביותר!)
-#    נחליט איזה קובץ מקורי הולך לאיזו קבוצה.
-#    חשוב לוודא שבכל קבוצה (train, validation) יש לפחות קובץ אחד מכל מחלקה.
-
-#    * man.csv: הקובץ היחיד ל-Steps, חייבים לפצל אותו.
-#    * car.csv, car2.csv: נשים אחד ב-Train, אחד ב-Validation.
-#    * nothing.csv, nothing2.csv: נשים אחד ב-Train, אחד ב-Validation.
-
-SPLIT_CONFIG = {
-    # קבצים שילכו לקבוצת האימון (Train)
-    "train": [
-        {"original_file": "man.csv", "output_file": "train_man.csv", "split_ratio": 0.8}, # ניקח 80% מ-man.csv לאימון
-        {"original_file": "car.csv", "output_file": "train_car.csv", "split_ratio": 1.0}, # כל car.csv הולך לאימון
-        {"original_file": "nothing.csv", "output_file": "train_nothing.csv", "split_ratio": 1.0} # כל nothing.csv הולך לאימון
-    ],
-    # קבצים שילכו לקבוצת הוולידציה (Validation)
-    "validation": [
-        {"original_file": "man.csv", "output_file": "validation_man.csv", "split_ratio": 0.2}, # ניקח 20% הנותרים מ-man.csv לוולידציה
-        {"original_file": "car2.csv", "output_file": "validation_car2.csv", "split_ratio": 1.0}, # כל car2.csv הולך לוולידציה
-        {"original_file": "nothing2.csv", "output_file": "validation_nothing2.csv", "split_ratio": 1.0} # כל nothing2.csv הולך לוולידציה
-    ]
+TRAIN_DATA_MAP = {
+    LABEL_STEPS:   {'path': [os.path.join(TRAIN_DATA_DIR, 'train_man.csv')]},
+    LABEL_VEHICLE: {'path': [os.path.join(TRAIN_DATA_DIR, 'train_car.csv')]},
+    LABEL_NOISE:   {'path': [os.path.join(TRAIN_DATA_DIR, 'train_nothing.csv')]}
 }
 
-# יחס החלוקה עבור הקובץ שצריך לפצל (man.csv)
-TRAIN_SPLIT_RATIO_FOR_MAN = 0.8 # 80% לאימון
+VAL_DATA_MAP = {
+    LABEL_STEPS:   {'path': [os.path.join(VAL_DATA_DIR, 'validation_man.csv')]},
+    LABEL_VEHICLE: {'path': [os.path.join(VAL_DATA_DIR, 'validation_car2.csv')]},
+    LABEL_NOISE:   {'path': [os.path.join(VAL_DATA_DIR, 'validation_nothing2.csv')]}
+}
 
-# ======================================================================
-# =                      יצירת תיקיות פלט                           =
-# ======================================================================
-train_output_dir = os.path.join(OUTPUT_BASE_DIR, TRAIN_DIR_NAME)
-validation_output_dir = os.path.join(OUTPUT_BASE_DIR, VALIDATION_DIR_NAME)
 
-try:
-    os.makedirs(train_output_dir, exist_ok=True)
-    os.makedirs(validation_output_dir, exist_ok=True)
-    print(f"Output directories created/ensured:")
-    print(f"  Train data: {train_output_dir}")
-    print(f"  Validation data: {validation_output_dir}")
-except OSError as e:
-    print(f"Error creating directories: {e}")
+
+
+
+
+
+
+# --- טעינת נתוני אימון ---
+print("\n=== Loading Prepared Training Dataset ===")
+# לא צריכים groups יותר כי החלוקה קבועה
+train_specs, train_stat_feats, train_labels, _ = load_data_hybrid_by_file(TRAIN_DATA_MAP)
+if train_specs.size == 0:
+    print("CRITICAL ERROR: Failed to load training dataset. Exiting.")
     exit()
-print("-" * 30)
+# נעביר את הנתונים האלה ישירות ל-SMOTE בהמשך
 
-# ======================================================================
-# =                      תהליך הפיצול והשמירה                         =
-# ======================================================================
+# --- טעינת נתוני וולידציה ---
+print("\n=== Loading Prepared Validation Dataset ===")
+val_specs, val_stat_feats, val_labels, _ = load_data_hybrid_by_file(VAL_DATA_MAP)
+if val_specs.size == 0:
+    print("CRITICAL ERROR: Failed to load validation dataset. Exiting.")
+    exit()
+# נעביר את הנתונים האלה ישירות ליצירת val_dataset בהמשך
 
-processed_files_split = {} # למעקב אחר קבצים שכבר פוצלו
+# --- החלף את החלק הזה: ---
+# X_spec_train = orig_specs[train_idx]
+# X_stat_train_orig = orig_stat_feats[train_idx]
+# y_train_orig = orig_labels[train_idx]
+# X_spec_val   = orig_specs[val_idx]
+# X_stat_val   = orig_stat_feats[val_idx]
+# y_val        = orig_labels[val_idx]
+# --- בנתונים שטענו עכשיו ---
+X_spec_train = train_specs           # נתוני אימון - ספקטרוגרמות
+X_stat_train_orig = train_stat_feats # נתוני אימון - תכונות (לפני SMOTE)
+y_train_orig = train_labels          # נתוני אימון - תוויות (לפני SMOTE)
 
-# --- לולאה על קבצי האימון ---
-print("Processing files for TRAINING set...")
-for item in SPLIT_CONFIG["train"]:
-    original_filename = item["original_file"]
-    output_filename = item["output_file"]
-    split_ratio = item["split_ratio"]
-    source_path = os.path.join(SOURCE_DATA_DIR, original_filename)
-    output_path = os.path.join(train_output_dir, output_filename)
+X_spec_val = val_specs             # נתוני וולידציה - ספקטרוגרמות
+X_stat_val = val_stat_feats       # נתוני וולידציה - תכונות
+y_val = val_labels                # נתוני וולידציה - תוויות
 
-    print(f"  Processing '{original_filename}' -> '{output_filename}'")
-
-    if not os.path.exists(source_path):
-        print(f"    ERROR: Source file not found: {source_path}. Skipping.")
-        continue
-
-    try:
-        # קריאת הקובץ המקורי (ללא כותרת)
-        df = pd.read_csv(source_path, header=None)
-        if df.empty:
-            print(f"    WARNING: Source file '{original_filename}' is empty. Skipping.")
-            continue
-
-        # אם צריך את כל הקובץ
-        if split_ratio == 1.0:
-            df_to_save = df
-        # אם צריך לפצל (זה יקרה רק פעם אחת לקובץ man.csv)
-        elif original_filename not in processed_files_split:
-            total_rows = len(df)
-            split_point = math.floor(total_rows * TRAIN_SPLIT_RATIO_FOR_MAN)
-            if split_point == 0 or split_point >= total_rows:
-                 print(f"    WARNING: Invalid split point for {original_filename}. Taking all/no data for train.")
-                 df_to_save = df if split_point > 0 else df.iloc[0:0] # שמירת DataFrame ריק אם אין שורות
-            else:
-                df_to_save = df.iloc[:split_point] # שורות מההתחלה עד נקודת הפיצול
-                # שמירת החלק השני לוולידציה במשתנה זמני
-                processed_files_split[original_filename] = df.iloc[split_point:] # שורות מנקודת הפיצול עד הסוף
-            print(f"    Splitting '{original_filename}': Taking first {len(df_to_save)} rows for Train.")
-        else:
-             print(f"    ERROR: File '{original_filename}' configured for split but already processed? Skipping train part.")
-             continue
-
-        # שמירת החלק הנבחר לקובץ ה-Train
-        df_to_save.to_csv(output_path, index=False, header=False)
-        print(f"    Saved {len(df_to_save)} rows to '{output_path}'")
-
-    except Exception as e:
-        print(f"    ERROR processing file {original_filename} for train set: {e}")
-
-print("-" * 30)
-
-# --- לולאה על קבצי הוולידציה ---
-print("Processing files for VALIDATION set...")
-for item in SPLIT_CONFIG["validation"]:
-    original_filename = item["original_file"]
-    output_filename = item["output_file"]
-    split_ratio = item["split_ratio"] # כאן זה מציין כמה מהקובץ *המקורי* הולך לוולידציה
-    source_path = os.path.join(SOURCE_DATA_DIR, original_filename)
-    output_path = os.path.join(validation_output_dir, output_filename)
-
-    print(f"  Processing '{original_filename}' -> '{output_filename}'")
-
-    if not os.path.exists(source_path):
-         # אם הקובץ המקורי לא קיים, אין מה לעשות (הודעה הודפסה קודם)
-        continue
-
-    try:
-        # אם הקובץ כבר פוצל, ניקח את החלק שנשמר
-        if original_filename in processed_files_split:
-            df_to_save = processed_files_split[original_filename]
-            print(f"    Taking remaining {len(df_to_save)} rows from split '{original_filename}' for Validation.")
-        # אם צריך את כל הקובץ (ולא פוצל קודם)
-        elif split_ratio == 1.0:
-             df = pd.read_csv(source_path, header=None)
-             if df.empty:
-                 print(f"    WARNING: Source file '{original_filename}' is empty. Skipping.")
-                 continue
-             df_to_save = df
-        else:
-             print(f"    ERROR: File '{original_filename}' configured for validation split ({split_ratio}) but wasn't processed correctly in train phase? Skipping.")
-             continue
-
-        # שמירת החלק הנבחר לקובץ ה-Validation
-        df_to_save.to_csv(output_path, index=False, header=False)
-        print(f"    Saved {len(df_to_save)} rows to '{output_path}'")
-
-    except Exception as e:
-        print(f"    ERROR processing file {original_filename} for validation set: {e}")
-
-print("-" * 30)
-print("--- Manual Data Split Script Finished ---")
+print(f"Loaded Train samples: {len(y_train_orig)}")
+print(f"Loaded Validation samples: {len(y_val)}")
+print(f"Train labels distribution before SMOTE: {np.bincount(y_train_orig)}")
+print(f"Validation labels distribution: {np.bincount(y_val)}")
